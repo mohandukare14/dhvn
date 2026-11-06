@@ -1,0 +1,21 @@
+# Virtual Environment & Python Caches
+venv/
+__pycache__/
+*.pyc
+*.pyo
+
+# Compiled Shared Libraries (rebuilt via `make`)
+lib/*.so
+*.so
+
+# Temporary logs & scratch
+*.log
+scratch/
+/tmp/
+
+# Datasets (11 GB PG-19 files should remain local)
+data/*.txt
+archive/
+train/
+test/
+validation/
