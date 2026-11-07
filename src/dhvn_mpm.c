@@ -82,12 +82,18 @@ static inline float mpm_gelu_grad(float x) {
 
 // Aligned allocation helper
 static void* mpm_aligned_alloc(size_t bytes) {
+#if defined(_WIN32) || defined(_WIN64)
+    void* ptr = malloc(bytes);
+    if (ptr) memset(ptr, 0, bytes);
+    return ptr;
+#else
     void* ptr = NULL;
     if (posix_memalign(&ptr, 32, bytes) != 0) {
         return malloc(bytes);
     }
     memset(ptr, 0, bytes);
     return ptr;
+#endif
 }
 
 // Create 4D Cartesian Grid (8x8x8x8 = 4096 nodes)

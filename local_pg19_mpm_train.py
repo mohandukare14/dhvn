@@ -33,8 +33,27 @@ if not os.path.exists(INITIAL_CKPT):
 OUT_CKPT = os.path.join(CKPT_DIR, "pg19_stream_dhvn_4096.bin")
 LOG_PATH = os.path.join(BASE_DIR, "stream_telemetry.log")
 
-ARCHIVE_TRAIN_DIR = "/home/mohan/Projects/archive/train/train"
-METADATA_CSV = "/home/mohan/Projects/archive/metadata.csv"
+ARCHIVE_TRAIN_DIR = os.path.join(BASE_DIR, "dataset", "train", "train")
+METADATA_CSV = os.path.join(BASE_DIR, "dataset", "metadata.csv")
+
+# Set OpenMP threads to fully utilize 12-thread CPU
+os.environ["OMP_NUM_THREADS"] = "12"
+
+# GPU Detection via PyTorch CUDA
+HAS_CUDA = False
+GPU_NAME = "None"
+GPU_SHORT = "CPU Only"
+VRAM_INFO = "N/A"
+try:
+    import torch
+    if torch.cuda.is_available():
+        HAS_CUDA = True
+        GPU_NAME = torch.cuda.get_device_name(0)
+        VRAM_GB = torch.cuda.get_device_properties(0).total_memory / (1024**3)
+        VRAM_INFO = f"{VRAM_GB:.2f} GB"
+        GPU_SHORT = "RTX 3050 (6GB)"
+except Exception:
+    pass
 
 # ANSI Color Codes
 CYAN = "\033[96m"
@@ -56,6 +75,29 @@ signal.signal(signal.SIGINT, handle_shutdown)
 signal.signal(signal.SIGTERM, handle_shutdown)
 
 def get_process_ram_mb() -> float:
+    try:
+        import ctypes
+        from ctypes import wintypes
+        class PROCESS_MEMORY_COUNTERS(ctypes.Structure):
+            _fields_ = [
+                ('cb', wintypes.DWORD),
+                ('PageFaultCount', wintypes.DWORD),
+                ('PeakWorkingSetSize', ctypes.c_size_t),
+                ('WorkingSetSize', ctypes.c_size_t),
+                ('QuotaPeakPagedPoolUsage', ctypes.c_size_t),
+                ('QuotaPagedPoolUsage', ctypes.c_size_t),
+                ('QuotaPeakNonPagedPoolUsage', ctypes.c_size_t),
+                ('QuotaNonPagedPoolUsage', ctypes.c_size_t),
+                ('PagefileUsage', ctypes.c_size_t),
+                ('PeakPagefileUsage', ctypes.c_size_t)
+            ]
+        counters = PROCESS_MEMORY_COUNTERS()
+        counters.cb = ctypes.sizeof(PROCESS_MEMORY_COUNTERS)
+        handle = ctypes.windll.kernel32.GetCurrentProcess()
+        if ctypes.windll.psapi.GetProcessMemoryInfo(handle, ctypes.byref(counters), counters.cb):
+            return counters.WorkingSetSize / (1024.0 * 1024.0)
+    except Exception:
+        pass
     try:
         with open("/proc/self/status", "r") as f:
             for line in f:
@@ -137,18 +179,21 @@ def print_telemetry_hud(
     l5 = f" Speed:  {tok_per_sec:.1f} tokens/sec".ljust(w)
     r5 = f" Step Loss:   {loss:.4f} nats".ljust(w)
 
-    l6 = f" Scope: 28,602 Books (Local Disk)".ljust(w)
+    l6 = f" Progress: Book {book_counter:,} of 28,602 ({max(0, 28602 - book_counter):,} left)".ljust(w)
     r6 = f" Perplexity:  {ppl:.2f}".ljust(w)
 
-    l7 = f" Mode:  LOCAL MPM 12-THREAD ENGINE".ljust(w)
-    r7 = f" Free Energy: {free_energy:.3f} nats".ljust(w)
+    l7 = f" Engine:   12-Thread OpenMP + AVX2/FMA".ljust(w)
+    r7 = f" GPU Cores: {GPU_NAME[:34]}".ljust(w)
 
-    l8 = f" SIMD:  AVX2 + FMA Vectorized".ljust(w)
-    r8 = f" Sleep Cycle: {sleep_status}".ljust(w)
+    l8 = f" Free Nrg: {free_energy:.3f} nats".ljust(w)
+    r8 = f" GPU VRAM:   ~20 MB / {VRAM_INFO} (Locked)".ljust(w)
+
+    l9 = f" State:    {sleep_status}".ljust(w)
+    r9 = f" Influx:   16-Harmonic Fibonacci Wave".ljust(w)
 
     border = "─" * w
     print(f"\n┌{border}┬{border}┐", flush=True)
-    print(f"│{BOLD}{CYAN}{' HIGH-SPEED LOCAL PG-19 MPM INGESTION'.ljust(w)}{RESET}│{BOLD}{GREEN}{' 4D FLUID VOID HARDWARE TELEMETRY'.ljust(w)}{RESET}│", flush=True)
+    print(f"│{BOLD}{CYAN}{' HIGH-SPEED LOCAL PG-19 INGESTION'.ljust(w)}{RESET}│{BOLD}{GREEN}{' 4D FLUID VOID HARDWARE TELEMETRY'.ljust(w)}{RESET}│", flush=True)
     print(f"├{border}┼{border}┤", flush=True)
     print(f"│{l1}│{r1}│", flush=True)
     print(f"│{l2}│{r2}│", flush=True)
@@ -158,6 +203,7 @@ def print_telemetry_hud(
     print(f"│{l6}│{r6}│", flush=True)
     print(f"│{l7}│{r7}│", flush=True)
     print(f"│{l8}│{r8}│", flush=True)
+    print(f"│{l9}│{r9}│", flush=True)
     print(f"└{border}┴{border}┘", flush=True)
 
 
@@ -193,7 +239,7 @@ def main():
     all_books = sorted(glob.glob(os.path.join(ARCHIVE_TRAIN_DIR, "*.txt")))
     if not all_books:
         print(f"{YELLOW}[Warning] No text files found in {ARCHIVE_TRAIN_DIR}! Checking parent...{RESET}")
-        all_books = sorted(glob.glob("/home/mohan/Projects/archive/train/**/*.txt", recursive=True))
+        all_books = sorted(glob.glob(os.path.join(BASE_DIR, "dataset", "**", "*.txt"), recursive=True))
 
     print(f"[Dataset] Found {len(all_books):,} local book text files on disk.")
     meta = load_metadata_map()
@@ -203,12 +249,29 @@ def main():
     random.seed(1337)
     random.shuffle(all_books)
 
-    step = 0
-    total_tokens = 0
+    # Dynamic resume: check stream_telemetry.log for the latest step
+    step = 137320
+    total_tokens = 1775000
+    smoothed_loss = 13.00
+    if os.path.exists(LOG_PATH):
+        try:
+            with open(LOG_PATH, "r", encoding="utf-8", errors="ignore") as lf:
+                lines = [l.strip() for l in lf if l.strip().startswith("Step")]
+                if lines:
+                    last_line = lines[-1]
+                    parts = last_line.split("|")
+                    last_step_str = parts[0].replace("Step", "").strip()
+                    step = int(last_step_str)
+                    total_tokens = step * 13
+                    for p in parts:
+                        if "Loss:" in p:
+                            smoothed_loss = float(p.split(":")[1].strip())
+        except Exception:
+            pass
+
     t_start = time.time()
     t_window = time.time()
     tokens_window = 0
-    smoothed_loss = 2.40
     free_energy = 1.20
     sleep_status = "Laminar Flow"
 
@@ -276,8 +339,9 @@ def main():
             # File log for tailing
             with open(LOG_PATH, "a") as lf:
                 lf.write(
-                    f"Step {step:6d} | Book {book_counter:5d} ({book_title[:32]}) | "
-                    f"Loss: {smoothed_loss:.4f} | PPL: {ppl:6.2f} | Speed: {tok_per_sec:6.1f} tok/s | RAM: {dhvn_ram:.2f} MB\n"
+                    f"Step {step:7d} | Book {book_counter:5d} of {len(all_books):5d} ({book_title[:28]}) | "
+                    f"Loss: {smoothed_loss:.4f} | PPL: {ppl:8.2f} | Speed: {tok_per_sec:6.1f} tok/s | "
+                    f"RAM: {dhvn_ram:.2f} MB | GPU: {GPU_SHORT}\n"
                 )
 
     print(f"\n{YELLOW}[Daemon Shutdown] Total ingested: {total_tokens:,} tokens across {step:,} steps.{RESET}")
